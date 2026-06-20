@@ -5,10 +5,17 @@
   
   **AI-Powered Reading & Vocabulary Companion**
 
-  [![React Native](https://img.shields.io/badge/React_Native-20232A?style=for-the-badge&logo=react&logoColor=61DAFB)](#)
-  [![Expo](https://img.shields.io/badge/Expo-1B1F23?style=for-the-badge&logo=expo&logoColor=white)](#)
-  [![Supabase](https://img.shields.io/badge/Supabase-3ECF8E?style=for-the-badge&logo=supabase&logoColor=white)](#)
-  [![Gemini API](https://img.shields.io/badge/Google_Gemini-8E75B2?style=for-the-badge&logo=google&logoColor=white)](#)
+  <a href="https://apps.apple.com/us/app/readyours-ai-language-reading/id6751147031">
+    <img src="https://upload.wikimedia.org/wikipedia/commons/3/3c/Download_on_the_App_Store_Badge.svg" alt="Download on the App Store" height="45">
+  </a>
+  <a href="https://play.google.com/store/apps/details?id=com.fdapps.readyours">
+    <img src="https://upload.wikimedia.org/wikipedia/commons/7/78/Google_Play_Store_badge_EN.svg" alt="Get it on Google Play" height="45">
+  </a>
+  <br><br>
+  <img src="https://img.shields.io/badge/React_Native-20232A?style=for-the-badge&logo=react&logoColor=61DAFB" alt="React Native">
+  <img src="https://img.shields.io/badge/Expo-1B1F23?style=for-the-badge&logo=expo&logoColor=white" alt="Expo">
+  <img src="https://img.shields.io/badge/Supabase-3ECF8E?style=for-the-badge&logo=supabase&logoColor=white" alt="Supabase">
+  <img src="https://img.shields.io/badge/Google_Gemini-8E75B2?style=for-the-badge&logo=google&logoColor=white" alt="Gemini API">
 
   *Note: This repository serves as a technical showcase. The source code is closed-source to protect intellectual property.*
 </div>
@@ -88,36 +95,49 @@ Here is a conceptual look at how the `generate-story` edge function acts as the 
 
 ```typescript
 // supabase/functions/generate-story/index.ts
-import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
+import "jsr:@supabase/functions-js/edge-runtime.d.ts"
+import { GoogleGenerativeAI } from "npm:@google/generative-ai"
+import { createClient } from "npm:@supabase/supabase-js@2"
+
+// Specialized Error Handling for AI unreliability
+class RetryableAIError extends Error { /* ... */ }
+class FatalAIError extends Error { /* ... */ }
 
 serve(async (req) => {
   try {
-    const { level, topic, length, userId } = await req.json()
+    const requestData = await req.json();
+    
+    // 1. Generate Prompt Directives (AI's Content Strategy)
+    const directivesPrompt = createDirectivesPrompt(requestData);
+    const directivesResponse = await gemini.generateContent(directivesPrompt);
+    
+    // 2. Generate Final Story Text based on Directives
+    const storyPrompt = createStoryPrompt(requestData, directivesResponse);
+    const rawStoryText = await gemini.generateContent(storyPrompt);
 
-    // 1. Generate Raw Text (Two-step Gemini flow)
-    const promptStructure = await gemini.createStructure(level, topic);
-    const rawStoryText = await gemini.generateFinalText(promptStructure, length);
-
-    // 2. NLP Processing via GCP Cloud Function (spaCy)
+    // 3. NLP Processing via GCP (Sentence Splitting & Tokenization)
+    // Sends the raw text to our Python spaCy Cloud Function
     const nlpResponse = await fetch('https://[GCP-REGION]-[PROJECT].cloudfunctions.net/stem-words', {
       method: 'POST',
       body: JSON.stringify({ text: rawStoryText }),
     });
     const { sentences, words, stems } = await nlpResponse.json();
 
-    // 3. Translation Pipeline
+    // 4. Batch Translation Pipeline
     const translatedSentences = await translationService.translateSentences(sentences);
     const translatedWords = await translationService.translateWords(stems);
 
-    // 4. Combine and Persist to Database
-    const finalStoryData = assembleStoryObject(rawStoryText, translatedSentences, translatedWords);
+    // 5. Structure & Persist to Supabase Database
+    const finalStoryData = assembleStructuredContent(rawStoryText, translatedSentences, translatedWords);
     await supabaseClient.from('stories').insert(finalStoryData);
 
-    // Return the final result to the client
-    return new Response(JSON.stringify(finalStoryData), { status: 200 })
+    return new Response(JSON.stringify({ success: true, structured_content: finalStoryData }), { status: 200 });
 
   } catch (error) {
-    return new Response(JSON.stringify({ error: error.message }), { status: 500 })
+    if (error instanceof RetryableAIError) {
+      // Implement backoff or fallback model strategy
+    }
+    return new Response(JSON.stringify({ error: error.message }), { status: 500 });
   }
 })
 ```
@@ -132,35 +152,58 @@ Because the backend Edge Function completely pre-processes the text into a struc
 We use React Native's `Text` component nesting to create fluid, clickable paragraphs without sacrificing performance.
 
 ```javascript
+// src/components/StoryContent.js
 import React from 'react';
-import { View, Text, TouchableOpacity } from 'react-native';
+import { View, Text } from 'react-native';
 
-/**
- * Renders a sentence where every word is an interactive touch target.
- */
-const InteractiveSentence = ({ sentence, onWordPress }) => {
-  return (
-    <Text style={styles.sentenceText}>
-      {sentence.words.map((wordObj, index) => (
-        <React.Fragment key={`${sentence.id}-word-${index}`}>
-          <TouchableOpacity 
-            onPress={() => onWordPress(wordObj)}
-            activeOpacity={0.6}
-          >
-            <Text style={[
-              styles.word, 
-              wordObj.isUnknown && styles.highlightedWord
-            ]}>
-              {wordObj.original_word}
+// Memoized to prevent thousands of unnecessary re-renders when a single word's state changes
+const MemoizedClickableText = React.memo(({ token, sentenceId, paragraphId, translations, onPress }) => {
+    // Only 'word' tokens are clickable (excluding punctuation and spaces)
+    const handlePress = translations && onPress
+        ? () => onPress(sentenceId, token.word_id, paragraphId, token.text, translations)
+        : undefined;
+
+    return (
+        <Text onPress={handlePress}>
+            {token.text}
+        </Text>
+    );
+});
+
+const StoryContent = ({ story, translationsMap, onWordClick }) => {
+    // Render the structured content (Paragraphs -> Sentences -> Tokens)
+    return story.structured_content.map((paragraph, pIndex) => (
+        <View key={`paragraph-${pIndex}`} style={styles.paragraphContainer}>
+            {/* Nesting Text components ensures native text wrapping without flexbox performance hits */}
+            <Text style={styles.wordTextStyles}>
+                {paragraph.sentences.flatMap((sentence) => (
+                    sentence.tokens.map((token) => {
+                        const key = `${paragraph.paragraph_id}-${sentence.sentence_id}-${token.word_id || token.text}`;
+                        let translations = null;
+                        
+                        if (token.type === 'word') {
+                            const newFormatKey = `${paragraph.paragraph_id}-${sentence.sentence_id}-${token.word_id}`;
+                            translations = translationsMap.get(newFormatKey);
+                        }
+
+                        return (
+                            <MemoizedClickableText
+                                key={key}
+                                token={token}
+                                sentenceId={sentence.sentence_id}
+                                paragraphId={paragraph.paragraph_id}
+                                translations={translations}
+                                onPress={onWordClick}
+                            />
+                        );
+                    })
+                ))}
             </Text>
-          </TouchableOpacity>
-          {/* Preserve natural spacing */}
-          <Text>{wordObj.trailing_space}</Text> 
-        </React.Fragment>
-      ))}
-    </Text>
-  );
+        </View>
+    ));
 };
+
+export default React.memo(StoryContent);
 ```
 
 ---
@@ -178,8 +221,8 @@ const InteractiveSentence = ({ sentence, onWordPress }) => {
 ## 📁 Project Architecture Overview
 
 ```text
-story-generator/
-├── english-app/               # Main React Native (Expo) Application
+ReadYoursProject/
+├── App/                       # Main React Native (Expo) Application
 │   ├── src/
 │   │   ├── components/        # Reusable UI components (InteractiveSentence, etc.)
 │   │   ├── screens/           # Main views (Generate, Read, Dictionary)
@@ -200,7 +243,7 @@ While the code is private, we welcome feedback, bug reports, and feature request
 
 - **Report a Bug:** [Open an Issue](../../issues)
 - **Request a Feature:** [Open an Issue](../../issues)
-- **Developer Contact:** Ömer - [LinkedIn](#)
+- **Developer Contact:** [dikmenomerf@gmail.com](mailto:dikmenomerf@gmail.com)
 
 ---
 *© 2026 ReadYours. All Rights Reserved.*
