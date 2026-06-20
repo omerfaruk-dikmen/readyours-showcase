@@ -42,95 +42,91 @@ The core philosophy of ReadYours is that **language acquisition is most effectiv
 
 ## 🧠 Core Architecture: The `generate-story` Pipeline
 
-The most complex and vital piece of architecture in ReadYours is the **Story Generation Pipeline**. It's not just about calling an AI API; it involves an intricate data processing flow that transforms raw AI output into a fully interactive learning experience.
+The most complex and vital piece of architecture in ReadYours is the **Story Generation Pipeline**. To ensure maximum performance, security, and separation of concerns, the entire generation and processing pipeline runs on the backend via a **Supabase Edge Function** (`generate-story`). The mobile client simply sends the user's preferences and waits for the final, fully-processed result.
 
-### 🔄 The Data Flow
+### 🔄 The Backend Data Flow
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant User
     participant Client as React Native App
+    participant Edge as Supabase Edge Function<br>(generate-story)
     participant AI as Gemini AI API
-    participant NLP as Text Processor (NLP)
+    participant GCP as GCP Cloud Function<br>(spaCy NLP)
     participant DB as Supabase DB
 
-    User->>Client: Select: Level (B1), Topic (Sci-Fi), Length
-    Client->>AI: Send structured prompt with strict constraints
-    AI-->>Client: Return raw story text
+    Client->>Edge: Invoke generate-story with parameters (Level, Topic, Length)
     
     rect rgb(30, 41, 59)
-    note right of Client: Complex Text Processing Phase
-    Client->>NLP: Pass raw text
-    NLP->>NLP: 1. Sentence Boundary Disambiguation
-    NLP->>NLP: 2. Tokenize sentences into individual words
-    NLP->>NLP: 3. Algorithmic Stemming (Find root forms)
-    NLP->>NLP: 4. Fetch/Generate translations for unique stems
+    note right of Edge: Phase 1: AI Generation
+    Edge->>AI: Request 1: Generate core story constraints
+    AI-->>Edge: Return structure
+    Edge->>AI: Request 2: Generate final story text based on structure
+    AI-->>Edge: Return raw story text
     end
     
-    NLP-->>Client: Return Structured Story Object (Sentences & Tokens)
-    Client->>DB: Transaction: Save Story -> Sentences -> Words
-    DB-->>Client: Success Confirmation
+    rect rgb(51, 65, 85)
+    note right of Edge: Phase 2: NLP Processing
+    Edge->>GCP: Send raw text for NLP processing
+    Note right of GCP: Python/spaCy: Sentence splitting, Tokenization, Stemming
+    GCP-->>Edge: Return structured NLP data (Stems, Sentences, Words)
+    end
+    
+    rect rgb(71, 85, 105)
+    note right of Edge: Phase 3: Translation & Persistence
+    Edge->>Edge: Perform translations for unique words & sentences
+    Edge->>DB: Save Story -> Sentences -> Words
+    DB-->>Edge: Transaction Success
+    end
+    
+    Edge-->>Client: Return completely processed and saved Story Object
     Client-->>User: Render Interactive Reading UI
 ```
 
-### 💻 Implementation Highlight: Story Generation
-Here is a conceptual look at how the pipeline is orchestrated on the client/backend before being persisted to the database.
+### 💻 Implementation Highlight: Supabase Edge Function
+Here is a conceptual look at how the `generate-story` edge function acts as the central orchestrator for the AI and NLP services.
 
-```javascript
-/**
- * Orchestrates the complete generation and processing of a new story.
- * This function handles API communication, NLP processing, and DB transactions.
- */
-async function generateAndProcessStory(userPreferences) {
+```typescript
+// supabase/functions/generate-story/index.ts
+import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
+
+serve(async (req) => {
   try {
-    // 1. Generate Raw Text via Gemini API
-    const rawText = await geminiService.generateText({
-      level: userPreferences.level,
-      topic: userPreferences.topic,
-      length: userPreferences.length
+    const { level, topic, length, userId } = await req.json()
+
+    // 1. Generate Raw Text (Two-step Gemini flow)
+    const promptStructure = await gemini.createStructure(level, topic);
+    const rawStoryText = await gemini.generateFinalText(promptStructure, length);
+
+    // 2. NLP Processing via GCP Cloud Function (spaCy)
+    const nlpResponse = await fetch('https://[GCP-REGION]-[PROJECT].cloudfunctions.net/stem-words', {
+      method: 'POST',
+      body: JSON.stringify({ text: rawStoryText }),
     });
+    const { sentences, words, stems } = await nlpResponse.json();
 
-    // 2. NLP Processing: Splitting and Tokenization
-    // Uses custom regex and algorithms to handle edge cases in punctuation
-    const sentences = textProcessor.splitIntoSentences(rawText);
-    
-    const processedSentences = await Promise.all(sentences.map(async (sentence, index) => {
-      // Tokenize and extract stems for each word
-      const tokens = textProcessor.tokenize(sentence);
-      const wordsData = await stemAndTranslateService.processTokens(tokens);
-      
-      return {
-        order: index,
-        originalText: sentence,
-        words: wordsData 
-      };
-    }));
+    // 3. Translation Pipeline
+    const translatedSentences = await translationService.translateSentences(sentences);
+    const translatedWords = await translationService.translateWords(stems);
 
-    // 3. Persist to Supabase Database
-    // We save the story, its relational sentences, and word mappings
-    const savedStory = await supabaseClient.rpc('insert_complete_story', {
-      user_id: userPreferences.userId,
-      metadata: userPreferences,
-      content: processedSentences
-    });
+    // 4. Combine and Persist to Database
+    const finalStoryData = assembleStoryObject(rawStoryText, translatedSentences, translatedWords);
+    await supabaseClient.from('stories').insert(finalStoryData);
 
-    return savedStory;
+    // Return the final result to the client
+    return new Response(JSON.stringify(finalStoryData), { status: 200 })
 
   } catch (error) {
-    errorHandler.log(error);
-    throw new GenerationError("Failed to generate and process story");
+    return new Response(JSON.stringify({ error: error.message }), { status: 500 })
   }
-}
+})
 ```
 
 ---
 
 ## 📖 Feature: Interactive Reading
 
-Once the text is generated and processed, it must be rendered in a way that allows the user to interact with **every single word**.
-
-Because we pre-processed the text into a structured JSON format (Words belonging to Sentences, Sentences belonging to a Story), the UI rendering is highly optimized.
+Because the backend Edge Function completely pre-processes the text into a structured JSON format (Words belonging to Sentences, Sentences belonging to a Story) with all roots and translations ready, the client UI rendering is highly optimized.
 
 ### 💻 Implementation Highlight: Render Engine
 We use React Native's `Text` component nesting to create fluid, clickable paragraphs without sacrificing performance.
@@ -172,12 +168,12 @@ const InteractiveSentence = ({ sentence, onWordPress }) => {
 ## 🛠️ Tech Stack & Infrastructure
 
 - **Mobile Framework:** React Native / Expo (Cross-platform iOS & Android)
-- **Backend & Database:** Supabase (PostgreSQL, Row Level Security, RPCs)
-- **Authentication:** Supabase Auth (Email & Social Logins)
-- **AI Integration:** Google Gemini API (Strict prompt engineering for language leveling)
-- **Cloud Functions:** GCP (Google Cloud Platform) Functions for heavy NLP tasks like word stemming.
-- **State Management:** React Context API / Zustand
-- **Monetization:** RevenueCat (In-app purchases and subscription management)
+- **Backend Orchestration:** Supabase Edge Functions (Deno)
+- **Database:** Supabase (PostgreSQL, Row Level Security)
+- **Authentication:** Supabase Auth
+- **AI Integration:** Google Gemini API (Strict prompt engineering)
+- **NLP Engine:** GCP Cloud Functions (Python + spaCy) for heavy NLP tasks.
+- **Monetization:** RevenueCat
 
 ## 📁 Project Architecture Overview
 
@@ -186,17 +182,14 @@ story-generator/
 ├── english-app/               # Main React Native (Expo) Application
 │   ├── src/
 │   │   ├── components/        # Reusable UI components (InteractiveSentence, etc.)
-│   │   ├── config/            # API keys and environment configurations
-│   │   ├── context/           # Global state (UserContext, ThemeContext)
 │   │   ├── screens/           # Main views (Generate, Read, Dictionary)
-│   │   ├── store/             # Local data management / Caching
-│   │   ├── utils/             # NLP logic, Gemini helpers, Formatters
-│   │   └── paywall/           # RevenueCat integration screens
-│   ├── supabase/              # Local Supabase configurations
+│   │   └── utils/             # Client-side helpers
 │   └── App.js                 # App Entry Point & Navigation Wrapper
-├── gcp-functions/             # Google Cloud Functions
-│   └── stem-words-function/   # Python/Node function for algorithmic word stemming
-└── prd.md                     # Product Requirements Document
+├── supabase/                  # Supabase Backend
+│   └── functions/
+│       └── generate-story/    # Edge Function: Orchestrates AI -> NLP -> Translations -> DB
+└── gcp-functions/             # Google Cloud Functions
+    └── stem-words-function/   # Python/spaCy function for algorithmic word stemming
 ```
 
 ---
